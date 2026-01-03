@@ -5,6 +5,7 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
 #include <string.h>
 
 static const char *TAG = "qr_scanner_ui";
@@ -13,12 +14,72 @@ static lv_obj_t *scanner_screen = NULL;
 static lv_obj_t *result_label = NULL;
 static lv_obj_t *status_label = NULL;
 static lv_obj_t *scan_btn = NULL;
+static lv_obj_t *preview_canvas = NULL;
+
 static TaskHandle_t qr_scan_task_handle = NULL;
+static TaskHandle_t preview_task_handle = NULL;
+static QueueHandle_t qr_frame_queue = NULL;
+static QueueHandle_t preview_frame_queue = NULL;
+
 static struct quirc *qr_decoder = NULL;
 static bool scanning_active = false;
+static bool preview_active = false;
 
 extern bool lvgl_lock(int timeout_ms);
 extern void lvgl_unlock(void);
+
+#define PREVIEW_WIDTH 160
+#define PREVIEW_HEIGHT 120
+
+static lv_color_t *preview_buf = NULL;
+
+static void preview_task(void *param)
+{
+    ESP_LOGI(TAG, "Preview task started on core %d", xPortGetCoreID());
+
+    while (preview_active) {
+        camera_fb_t *fb = NULL;
+
+        // Wait for frame from preview queue
+        if (xQueueReceive(preview_frame_queue, &fb, pdMS_TO_TICKS(1000)) == pdTRUE && fb) {
+            // Downsample and convert grayscale to LVGL format
+            if (lvgl_lock(10)) {
+                // Proper downsampling with mirroring correction
+                // Camera frame is 320x240, preview is 160x120 (2:1 ratio)
+                for (int y = 0; y < PREVIEW_HEIGHT; y++) {
+                    for (int x = 0; x < PREVIEW_WIDTH; x++) {
+                        // Mirror both horizontally and vertically
+                        int src_x = (PREVIEW_WIDTH - 1 - x) * 2;
+                        int src_y = (PREVIEW_HEIGHT - 1 - y) * 2;
+
+                        // Ensure we don't exceed bounds
+                        if (src_x >= fb->width) src_x = fb->width - 1;
+                        if (src_y >= fb->height) src_y = fb->height - 1;
+
+                        uint8_t pixel = fb->buf[src_y * fb->width + src_x];
+
+                        // Convert grayscale to RGB565 (LVGL color format)
+                        preview_buf[y * PREVIEW_WIDTH + x] = lv_color_make(pixel, pixel, pixel);
+                    }
+                }
+
+                // Update canvas
+                if (preview_canvas) {
+                    lv_canvas_set_buffer(preview_canvas, preview_buf,
+                                        PREVIEW_WIDTH, PREVIEW_HEIGHT, LV_IMG_CF_TRUE_COLOR);
+                }
+
+                lvgl_unlock();
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(33)); // ~30 FPS preview
+    }
+
+    ESP_LOGI(TAG, "Preview task finished");
+    preview_task_handle = NULL;
+    vTaskDelete(NULL);
+}
 
 static void qr_scan_task(void *param)
 {
@@ -33,10 +94,9 @@ static void qr_scan_task(void *param)
     while (scanning_active) {
         int64_t frame_start = esp_timer_get_time();
 
-        // Capture frame from camera
-        fb = camera_capture_frame();
-        if (!fb) {
-            ESP_LOGE(TAG, "Failed to capture frame");
+        // Wait for frame from QR scanner queue
+        if (xQueueReceive(qr_frame_queue, &fb, pdMS_TO_TICKS(1000)) != pdTRUE || !fb) {
+            ESP_LOGW(TAG, "No frame received from queue");
             vTaskDelay(pdMS_TO_TICKS(100));
             continue;
         }
@@ -44,7 +104,7 @@ static void qr_scan_task(void *param)
         int64_t capture_time = esp_timer_get_time() - frame_start;
         frames_processed++;
 
-        ESP_LOGI(TAG, "Frame captured: %dx%d, format: %d, size: %zu bytes (capture: %lld ms)",
+        ESP_LOGI(TAG, "Frame received: %dx%d, format: %d, size: %zu bytes (wait: %lld ms)",
                  fb->width, fb->height, fb->format, fb->len, capture_time / 1000);
 
         // Decode QR codes
@@ -71,24 +131,14 @@ static void qr_scan_task(void *param)
             if (lvgl_lock(-1)) {
                 char result_text[512];
                 snprintf(result_text, sizeof(result_text),
-                         "QR Code Found!\n\n"
-                         "Data: %.120s\n\n"
-                         "--- Performance ---\n"
-                         "Decode: %lld ms\n"
-                         "Total: %lld ms\n"
-                         "Frames: %d\n"
-                         "FPS: %.1f",
+                         "%.80s\n\n"
+                         "Time: %lld ms | FPS: %.1f",
                          results[0].payload,
                          decode_time / 1000,
-                         total_scan_time / 1000,
-                         frames_processed,
                          fps);
                 lv_label_set_text(result_label, result_text);
 
-                char status_text[128];
-                snprintf(status_text, sizeof(status_text),
-                         "Status: Decoded in %lld ms!", total_scan_time / 1000);
-                lv_label_set_text(status_label, status_text);
+                lv_label_set_text(status_label, "QR Code Decoded!");
                 lvgl_unlock();
             }
 
@@ -97,10 +147,9 @@ static void qr_scan_task(void *param)
         } else {
             // Update status with current performance
             if (lvgl_lock(-1)) {
-                char status_text[128];
+                char status_text[64];
                 snprintf(status_text, sizeof(status_text),
-                         "Scanning... (frame %d, %lld ms)",
-                         frames_processed, decode_time / 1000);
+                         "Scanning... (%d)", frames_processed);
                 lv_label_set_text(status_label, status_text);
                 lvgl_unlock();
             }
@@ -109,14 +158,32 @@ static void qr_scan_task(void *param)
                      decode_time / 1000, total_frame_time / 1000);
         }
 
-        camera_return_frame(fb);
         vTaskDelay(pdMS_TO_TICKS(100));
+    }
+
+    // Stop preview task as well
+    preview_active = false;
+
+    // Wait for preview to finish
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    // Unregister consumers and clean up queues
+    if (qr_frame_queue) {
+        camera_unregister_consumer(qr_frame_queue);
+        vQueueDelete(qr_frame_queue);
+        qr_frame_queue = NULL;
+    }
+    if (preview_frame_queue) {
+        camera_unregister_consumer(preview_frame_queue);
+        vQueueDelete(preview_frame_queue);
+        preview_frame_queue = NULL;
     }
 
     // Update UI when scanning stops
     if (lvgl_lock(-1)) {
         if (decode_count == 0) {
-            lv_label_set_text(status_label, "Status: Scan Stopped");
+            lv_label_set_text(status_label, "Scan Stopped");
+            lv_label_set_text(result_label, "Press 'Start' to scan again");
         }
         lv_obj_clear_state(scan_btn, LV_STATE_DISABLED);
         lvgl_unlock();
@@ -134,14 +201,32 @@ static void scan_btn_event_handler(lv_event_t *e)
     if (code == LV_EVENT_CLICKED) {
         ESP_LOGI(TAG, "Scan button clicked");
 
-        if (!scanning_active) {
+        if (!scanning_active && !preview_active) {
+            // Create frame queues
+            qr_frame_queue = xQueueCreate(2, sizeof(camera_fb_t *));
+            preview_frame_queue = xQueueCreate(2, sizeof(camera_fb_t *));
+
+            if (!qr_frame_queue || !preview_frame_queue) {
+                ESP_LOGE(TAG, "Failed to create frame queues");
+                return;
+            }
+
+            // Register both consumers
+            camera_register_consumer(qr_frame_queue);
+            camera_register_consumer(preview_frame_queue);
+
             scanning_active = true;
-            lv_label_set_text(result_label, "Point camera at QR code...");
-            lv_label_set_text(status_label, "Status: Starting scan...");
+            preview_active = true;
+
+            lv_label_set_text(result_label, "Point camera at QR code");
+            lv_label_set_text(status_label, "Scanning...");
             lv_obj_add_state(scan_btn, LV_STATE_DISABLED);
 
+            // Start preview task on Core 1 (with LVGL)
+            xTaskCreatePinnedToCore(preview_task, "preview_task", 8192, NULL, 3,
+                                   &preview_task_handle, 1);
+
             // Create scan task on Core 0 (to avoid conflict with LVGL on Core 1)
-            // Stack size increased to 32KB to accommodate Quirc decoder
             xTaskCreatePinnedToCore(qr_scan_task, "qr_scan_task", 32768, NULL, 4,
                                    &qr_scan_task_handle, 0);
         }
@@ -176,50 +261,70 @@ void qr_scanner_ui_init(void)
         }
     }
 
+    // Allocate preview buffer
+    if (camera_ok && decoder_ok) {
+        preview_buf = heap_caps_malloc(PREVIEW_WIDTH * PREVIEW_HEIGHT * sizeof(lv_color_t), MALLOC_CAP_SPIRAM);
+        if (!preview_buf) {
+            ESP_LOGE(TAG, "Failed to allocate preview buffer");
+        }
+    }
+
     // Create scanner screen (even if camera failed - show error message)
     if (lvgl_lock(-1)) {
         scanner_screen = lv_obj_create(NULL);
 
-        // Create title label
+        // Create title label at the top
         lv_obj_t *title = lv_label_create(scanner_screen);
         lv_label_set_text(title, "QR Code Scanner");
         lv_obj_set_style_text_font(title, &lv_font_montserrat_16, 0);
-        lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 10);
+        lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 8);
 
-        // Create status label
+        // Create preview canvas centered horizontally, below title
+        if (camera_ok && decoder_ok && preview_buf) {
+            preview_canvas = lv_canvas_create(scanner_screen);
+            lv_canvas_set_buffer(preview_canvas, preview_buf,
+                                PREVIEW_WIDTH, PREVIEW_HEIGHT, LV_IMG_CF_TRUE_COLOR);
+            lv_obj_align(preview_canvas, LV_ALIGN_TOP_MID, 0, 35);
+            lv_obj_set_style_border_width(preview_canvas, 2, 0);
+            lv_obj_set_style_border_color(preview_canvas, lv_color_hex(0x00AA00), 0);
+            lv_obj_set_style_radius(preview_canvas, 4, 0);
+
+            // Clear preview to black
+            lv_canvas_fill_bg(preview_canvas, lv_color_black(), LV_OPA_COVER);
+        }
+
+        // Create status label centered below preview
         status_label = lv_label_create(scanner_screen);
         if (!camera_ok) {
-            lv_label_set_text(status_label, "Status: Camera Init Failed!");
+            lv_label_set_text(status_label, "Camera Failed!");
         } else if (!decoder_ok) {
-            lv_label_set_text(status_label, "Status: Decoder Init Failed!");
+            lv_label_set_text(status_label, "Decoder Failed!");
         } else {
-            lv_label_set_text(status_label, "Status: Ready");
+            lv_label_set_text(status_label, "Ready");
         }
         lv_obj_set_style_text_font(status_label, &lv_font_montserrat_12, 0);
-        lv_obj_align(status_label, LV_ALIGN_TOP_LEFT, 5, 35);
+        lv_obj_align(status_label, LV_ALIGN_TOP_MID, 0, 165);
 
-        // Create result label
+        // Create result label centered below status
         result_label = lv_label_create(scanner_screen);
         lv_label_set_long_mode(result_label, LV_LABEL_LONG_WRAP);
         lv_obj_set_style_text_font(result_label, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_align(result_label, LV_TEXT_ALIGN_CENTER, 0);
 
         if (!camera_ok) {
             lv_label_set_text(result_label,
-                "Camera initialization failed.\n\n"
-                "Possible causes:\n"
-                "- Camera not connected\n"
-                "- Wrong pin configuration\n"
-                "- I2C/SCCB communication issue\n\n"
-                "Check serial monitor for error code.");
+                "Camera initialization failed\n"
+                "Check camera connection");
         } else {
-            lv_label_set_text(result_label, "Press 'Scan' to start");
+            lv_label_set_text(result_label, "Press 'Start' to scan");
         }
         lv_obj_set_width(result_label, 220);
-        lv_obj_align(result_label, LV_ALIGN_CENTER, 0, 10);
+        lv_obj_align(result_label, LV_ALIGN_TOP_MID, 0, 185);
 
-        // Create scan button
+        // Create scan button at the bottom
         scan_btn = lv_btn_create(scanner_screen);
-        lv_obj_align(scan_btn, LV_ALIGN_BOTTOM_MID, 0, -20);
+        lv_obj_set_size(scan_btn, 120, 40);
+        lv_obj_align(scan_btn, LV_ALIGN_BOTTOM_MID, 0, -15);
 
         if (!camera_ok || !decoder_ok) {
             lv_obj_add_state(scan_btn, LV_STATE_DISABLED);
@@ -228,7 +333,7 @@ void qr_scanner_ui_init(void)
         }
 
         lv_obj_t *btn_label = lv_label_create(scan_btn);
-        lv_label_set_text(btn_label, camera_ok ? "Scan QR Code" : "Camera Error");
+        lv_label_set_text(btn_label, camera_ok ? "Start Scanning" : "Error");
         lv_obj_center(btn_label);
 
         // Load the scanner screen
@@ -250,14 +355,36 @@ void qr_scanner_ui_deinit(void)
     ESP_LOGI(TAG, "Deinitializing QR scanner UI");
 
     scanning_active = false;
+    preview_active = false;
 
+    // Wait for tasks to finish
     if (qr_scan_task_handle != NULL) {
         vTaskDelay(pdMS_TO_TICKS(200));
+    }
+    if (preview_task_handle != NULL) {
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+
+    // Unregister consumers
+    if (qr_frame_queue) {
+        camera_unregister_consumer(qr_frame_queue);
+        vQueueDelete(qr_frame_queue);
+        qr_frame_queue = NULL;
+    }
+    if (preview_frame_queue) {
+        camera_unregister_consumer(preview_frame_queue);
+        vQueueDelete(preview_frame_queue);
+        preview_frame_queue = NULL;
     }
 
     if (qr_decoder) {
         qr_decoder_destroy(qr_decoder);
         qr_decoder = NULL;
+    }
+
+    if (preview_buf) {
+        heap_caps_free(preview_buf);
+        preview_buf = NULL;
     }
 
     camera_deinit();

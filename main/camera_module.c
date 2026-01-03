@@ -5,6 +5,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
+#include <string.h>
 
 static const char *TAG = "camera_module";
 static TaskHandle_t capture_task_handle = NULL;
@@ -13,36 +15,77 @@ static bool camera_running = false;
 
 #define FRAME_QUEUE_SIZE 2
 
-// Dedicated capture task - continuously grabs frames and puts them in queue
+// Multi-consumer support
+static QueueHandle_t consumer_queues[MAX_FRAME_CONSUMERS];
+static int consumer_count = 0;
+static SemaphoreHandle_t consumer_mutex = NULL;
+
+typedef struct {
+    camera_fb_t *fb;
+    int ref_count;
+} frame_ref_t;
+
+// Dedicated capture task - continuously grabs frames and broadcasts to consumers
 static void camera_capture_task(void *param)
 {
     ESP_LOGI(TAG, "Camera capture task started on core %d", xPortGetCoreID());
+    camera_fb_t *last_fb = NULL;
 
     while (camera_running) {
         camera_fb_t *fb = esp_camera_fb_get();
         if (fb) {
-            // Try to send frame to queue (non-blocking)
-            if (xQueueSend(frame_queue, &fb, 0) != pdTRUE) {
-                // Queue full - discard oldest frame and return this one
-                camera_fb_t *old_fb = NULL;
-                if (xQueueReceive(frame_queue, &old_fb, 0) == pdTRUE) {
-                    esp_camera_fb_return(old_fb);
-                }
-                // Try again to send new frame
-                if (xQueueSend(frame_queue, &fb, 0) != pdTRUE) {
-                    // Still failed, just return it
-                    esp_camera_fb_return(fb);
+            // Return previous frame before broadcasting new one
+            if (last_fb) {
+                esp_camera_fb_return(last_fb);
+            }
+            last_fb = fb;
+
+            // If we have registered consumers, broadcast to them
+            if (xSemaphoreTake(consumer_mutex, portMAX_DELAY) == pdTRUE) {
+                if (consumer_count > 0) {
+                    // Broadcast frame to all registered consumers (overwrite old frames)
+                    for (int i = 0; i < consumer_count; i++) {
+                        if (consumer_queues[i] != NULL) {
+                            // Try to overwrite - clear old frame first
+                            camera_fb_t *old_fb = NULL;
+                            while (xQueueReceive(consumer_queues[i], &old_fb, 0) == pdTRUE) {
+                                // Just clearing the queue, old_fb points to old frame (already returned above)
+                            }
+                            // Send new frame
+                            if (xQueueSend(consumer_queues[i], &fb, 0) != pdTRUE) {
+                                ESP_LOGW(TAG, "Consumer %d queue send failed", i);
+                            }
+                        }
+                    }
+                    xSemaphoreGive(consumer_mutex);
+                } else {
+                    xSemaphoreGive(consumer_mutex);
+                    // No consumers, use legacy single queue mode
+                    if (xQueueSend(frame_queue, &fb, 0) != pdTRUE) {
+                        camera_fb_t *old_fb = NULL;
+                        if (xQueueReceive(frame_queue, &old_fb, 0) == pdTRUE) {
+                            esp_camera_fb_return(old_fb);
+                        }
+                        if (xQueueSend(frame_queue, &fb, 0) != pdTRUE) {
+                            esp_camera_fb_return(fb);
+                            last_fb = NULL;
+                        }
+                    }
                 }
             }
         }
-        // Small delay to prevent hogging CPU
-        vTaskDelay(pdMS_TO_TICKS(10));
+        vTaskDelay(pdMS_TO_TICKS(50)); // ~20 FPS capture rate
+    }
+
+    // Clean up - return last frame
+    if (last_fb) {
+        esp_camera_fb_return(last_fb);
     }
 
     // Clean up queue
     camera_fb_t *fb = NULL;
     while (xQueueReceive(frame_queue, &fb, 0) == pdTRUE) {
-        esp_camera_fb_return(fb);
+        // Frames already returned above
     }
 
     ESP_LOGI(TAG, "Camera capture task stopped");
@@ -53,6 +96,19 @@ static void camera_capture_task(void *param)
 esp_err_t camera_init(void)
 {
     ESP_LOGI(TAG, "Initializing camera...");
+
+    // Initialize consumer mutex
+    if (!consumer_mutex) {
+        consumer_mutex = xSemaphoreCreateMutex();
+        if (!consumer_mutex) {
+            ESP_LOGE(TAG, "Failed to create consumer mutex");
+            return ESP_FAIL;
+        }
+    }
+
+    // Initialize consumer array
+    memset(consumer_queues, 0, sizeof(consumer_queues));
+    consumer_count = 0;
 
     esp_err_t err = esp_camera_init(&camera_config);
     if (err != ESP_OK) {
@@ -134,6 +190,55 @@ esp_err_t camera_init(void)
     return ESP_OK;
 }
 
+esp_err_t camera_register_consumer(QueueHandle_t queue)
+{
+    if (!queue) {
+        ESP_LOGE(TAG, "Invalid queue handle");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    esp_err_t ret = ESP_FAIL;
+    if (xSemaphoreTake(consumer_mutex, portMAX_DELAY) == pdTRUE) {
+        if (consumer_count >= MAX_FRAME_CONSUMERS) {
+            ESP_LOGE(TAG, "Maximum consumers reached");
+            ret = ESP_ERR_NO_MEM;
+        } else {
+            consumer_queues[consumer_count] = queue;
+            consumer_count++;
+            ESP_LOGI(TAG, "Registered consumer %d (total: %d)", consumer_count - 1, consumer_count);
+            ret = ESP_OK;
+        }
+        xSemaphoreGive(consumer_mutex);
+    }
+    return ret;
+}
+
+esp_err_t camera_unregister_consumer(QueueHandle_t queue)
+{
+    if (!queue) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    esp_err_t ret = ESP_FAIL;
+    if (xSemaphoreTake(consumer_mutex, portMAX_DELAY) == pdTRUE) {
+        for (int i = 0; i < consumer_count; i++) {
+            if (consumer_queues[i] == queue) {
+                // Shift remaining consumers down
+                for (int j = i; j < consumer_count - 1; j++) {
+                    consumer_queues[j] = consumer_queues[j + 1];
+                }
+                consumer_queues[consumer_count - 1] = NULL;
+                consumer_count--;
+                ESP_LOGI(TAG, "Unregistered consumer (remaining: %d)", consumer_count);
+                ret = ESP_OK;
+                break;
+            }
+        }
+        xSemaphoreGive(consumer_mutex);
+    }
+    return ret;
+}
+
 camera_fb_t* camera_capture_frame(void)
 {
     if (!frame_queue) {
@@ -142,7 +247,7 @@ camera_fb_t* camera_capture_frame(void)
     }
 
     camera_fb_t *fb = NULL;
-    // Wait up to 4 seconds for a frame
+    // Wait up to 4 seconds for a frame (legacy single consumer mode)
     if (xQueueReceive(frame_queue, &fb, pdMS_TO_TICKS(4000)) != pdTRUE) {
         ESP_LOGE(TAG, "Timeout waiting for frame from queue");
         return NULL;
